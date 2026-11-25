@@ -53,12 +53,16 @@ export default function App() {
     );
   }
 
-  // Sin proyectos abiertos, o sin token en la variable de entorno, no se puede
-  // operar: Setup a pantalla completa (explica cómo configurar el token). El
-  // PAT nunca se pide ni se guarda en disco.
-  if (!config || !envPat) {
-    return <Setup mode={config ? "edit" : "add"} onDone={() => setSetupMode(null)} />;
+  // Sin proyectos abiertos: Setup a pantalla completa para abrir el primero.
+  if (!config) {
+    return <Setup mode="add" onDone={() => setSetupMode(null)} />;
   }
+
+  // Si falta el token de la org de la pestaña activa, esa pestaña muestra el
+  // Setup (que explica qué variable definir), pero las pestañas siguen visibles
+  // para poder pasar a otro proyecto. El PAT nunca se pide ni se guarda en disco.
+  const shownSetup = setupMode ?? (!envPat ? "edit" : null);
+  const canCancel = setupMode !== null && !(setupMode === "edit" && !envPat);
 
   return (
     <div className="h-full flex flex-col bg-slate-950">
@@ -67,14 +71,14 @@ export default function App() {
         onAdd={() => setSetupMode("add")}
         onSelect={() => setSetupMode(null)}
       />
-      {setupMode ? (
+      {shownSetup ? (
         <div className="flex-1 min-h-0">
           <Setup
             // key: al pasar de "editar" a "agregar" el formulario arranca de cero
-            key={`${setupMode}-${activeTabId}`}
-            mode={setupMode}
+            key={`${shownSetup}-${activeTabId}`}
+            mode={shownSetup}
             onDone={() => setSetupMode(null)}
-            onCancel={() => setSetupMode(null)}
+            onCancel={canCancel ? () => setSetupMode(null) : undefined}
           />
         </div>
       ) : (

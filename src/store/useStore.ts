@@ -117,7 +117,10 @@ async function loadPersistedTabData(tabId: string): Promise<TabData> {
 interface AppState extends TabData {
   // Config de la pestaña activa (null = no hay pestañas => Setup)
   config: AzureConfig | null;
-  envPat: string | null; // PAT detectado en variable de entorno
+  /** PAT de la organización de la pestaña activa (leído de variable de entorno) */
+  envPat: string | null;
+  /** En qué variable de entorno se encontró `envPat` */
+  envPatSource: string | null;
   configLoaded: boolean;
 
   // Pestañas
@@ -193,6 +196,9 @@ export const useStore = create<AppState>((set, get) => {
     } else {
       data = await loadPersistedTabData(target.id);
     }
+    // Token de la org de la pestaña nueva: se resuelve ANTES de activarla, para
+    // que el poller nunca arranque con el token de otra organización.
+    const pat = target ? await getEnvPat(target.config.org) : null;
     const store = await getStore();
     await store.set(ACTIVE_KEY, target?.id ?? null);
     // Filtros de la pestaña nueva, en el mismo momento que sus datos
@@ -203,6 +209,8 @@ export const useStore = create<AppState>((set, get) => {
       tabCache: cache,
       activeTabId: target?.id ?? null,
       config: target?.config ?? null,
+      envPat: pat?.value ?? null,
+      envPatSource: pat?.source ?? null,
     });
   }
 
@@ -210,6 +218,7 @@ export const useStore = create<AppState>((set, get) => {
     ...emptyTabData(),
     config: null,
     envPat: null,
+    envPatSource: null,
     configLoaded: false,
     tabs: [],
     activeTabId: null,
@@ -241,7 +250,7 @@ export const useStore = create<AppState>((set, get) => {
       }
       const active = tabs.find((t) => t.id === activeTabId);
       const data = active ? await loadPersistedTabData(active.id) : emptyTabData();
-      const envPat = await getEnvPat();
+      const pat = active ? await getEnvPat(active.config.org) : null;
       useFilters.getState().switchTab(activeTabId);
       set({
         ...data,
@@ -249,7 +258,8 @@ export const useStore = create<AppState>((set, get) => {
         activeTabId,
         tabCache: {},
         config: active?.config ?? null,
-        envPat,
+        envPat: pat?.value ?? null,
+        envPatSource: pat?.source ?? null,
         configLoaded: true,
       });
     },
@@ -269,7 +279,16 @@ export const useStore = create<AppState>((set, get) => {
       // inicial limpia con la nueva config / ventana de fecha (lookbackDays).
       await store.set(watermarkKey(activeTabId), null);
       await store.save();
-      set({ tabs: nextTabs, config: persisted, items: {}, watermark: null });
+      // La org pudo cambiar: el token se vuelve a resolver para la nueva
+      const pat = await getEnvPat(persisted.org);
+      set({
+        tabs: nextTabs,
+        config: persisted,
+        items: {},
+        watermark: null,
+        envPat: pat?.value ?? null,
+        envPatSource: pat?.source ?? null,
+      });
     },
 
     clearConfig: async () => {

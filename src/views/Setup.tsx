@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { testConnection } from "../lib/azureDevOps";
+import { getEnvPat, patVarName, type EnvPat } from "../lib/env";
 import { resolveConfig, useStore } from "../store/useStore";
 import { DEFAULT_LOOKBACK_DAYS, type AzureConfig } from "../types";
 
@@ -16,7 +17,6 @@ interface Props {
 
 export default function Setup({ mode, onDone, onCancel }: Props) {
   const config = useStore((s) => s.config);
-  const envPat = useStore((s) => s.envPat);
   const tabs = useStore((s) => s.tabs);
   const activeTabId = useStore((s) => s.activeTabId);
   const saveConfig = useStore((s) => s.saveConfig);
@@ -31,6 +31,28 @@ export default function Setup({ mode, onDone, onCancel }: Props) {
   const [team, setTeam] = useState(initial?.team ?? "");
   const [interval, setInterval] = useState(initial?.pollIntervalSec ?? 30);
   const [lookbackDays, setLookbackDays] = useState(initial?.lookbackDays ?? DEFAULT_LOOKBACK_DAYS);
+
+  // Token para la organización escrita: primero AZURE_DEVOPS_PAT_<ORG>, si no
+  // la genérica. Se vuelve a buscar (con una pequeña pausa) al cambiar la org.
+  const [envPat, setEnvPat] = useState<EnvPat | null>(null);
+  const [orgVar, setOrgVar] = useState("");
+  const [patChecked, setPatChecked] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setPatChecked(false);
+    const t = setTimeout(async () => {
+      const [pat, name] = await Promise.all([getEnvPat(org), patVarName(org.trim() || "ORG")]);
+      if (cancelled) return;
+      setEnvPat(pat);
+      setOrgVar(name);
+      setPatChecked(true);
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [org]);
+  const patIsOrgSpecific = !!envPat && envPat.source === orgVar;
 
   // ¿Ese org/proyecto ya está abierto en otra pestaña?
   const duplicate = tabs.find(
@@ -55,13 +77,14 @@ export default function Setup({ mode, onDone, onCancel }: Props) {
   });
 
   // Solo se puede operar si el token está en la variable de entorno.
-  const canSubmit = Boolean(org.trim() && project.trim() && envPat && !duplicate);
+  // patChecked: mientras se busca el token de una org recién escrita no se usa el de la anterior
+  const canSubmit = Boolean(org.trim() && project.trim() && patChecked && envPat && !duplicate);
 
   async function handleTest() {
     setTesting(true);
     setResult(null);
     try {
-      const effective = resolveConfig(buildConfig(), envPat)!;
+      const effective = resolveConfig(buildConfig(), envPat?.value ?? null)!;
       const count = await testConnection(effective);
       setResult({ ok: true, msg: `¡Conexión exitosa! Se detectaron ${count} items recientes.` });
     } catch (e) {
@@ -119,23 +142,42 @@ export default function Setup({ mode, onDone, onCancel }: Props) {
             />
           </Field>
 
-          {envPat ? (
-            <div className="text-sm rounded-lg px-3 py-2 bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-              ✓ Token detectado en la variable de entorno. Por seguridad, el PAT solo se lee de
-              ahí y nunca se guarda en disco.
+          {!patChecked ? (
+            <div className="text-sm rounded-lg px-3 py-2 bg-slate-800/60 text-slate-400 border border-slate-700">
+              Buscando token…
+            </div>
+          ) : envPat ? (
+            <div className="text-sm rounded-lg px-3 py-2 bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 space-y-1">
+              <p>
+                ✓ Token detectado en <code className="text-emerald-100">{envPat.source}</code>
+                {patIsOrgSpecific ? " (específico de esta organización)." : " (genérico, para cualquier organización)."}
+              </p>
+              {!patIsOrgSpecific && (
+                <p className="text-xs text-emerald-400/80">
+                  Si esta organización necesita otro token, definí{" "}
+                  <code className="text-emerald-100">{orgVar}</code> y reiniciá la app.
+                </p>
+              )}
+              <p className="text-xs text-emerald-400/80">
+                Por seguridad, el PAT solo se lee de variables de entorno y nunca se guarda en disco.
+              </p>
             </div>
           ) : (
             <div className="text-sm rounded-lg px-3 py-3 bg-amber-500/10 text-amber-200 border border-amber-500/30 space-y-2">
               <p className="font-medium">
-                ⚠️ No se detectó el token. Por seguridad, Scrum Cockpit lee el PAT solo desde una
-                variable de entorno (nunca se guarda en disco).
+                ⚠️ No se detectó un token para esta organización. Por seguridad, Scrum Cockpit lee
+                el PAT solo desde una variable de entorno (nunca se guarda en disco).
               </p>
-              <p>Definí <code className="text-amber-100">AZURE_DEVOPS_EXT_PAT</code> y reiniciá la app:</p>
-              <pre className="bg-black/40 rounded p-2 text-xs overflow-x-auto text-amber-100">{`# Linux / macOS
-export AZURE_DEVOPS_EXT_PAT="tu-token"
+              <p>
+                Definí <code className="text-amber-100">{orgVar}</code> (solo para esta
+                organización) o <code className="text-amber-100">AZURE_DEVOPS_EXT_PAT</code> (para
+                todas) y reiniciá la app:
+              </p>
+              <pre className="bg-black/40 rounded p-2 text-xs overflow-x-auto text-amber-100">{`# Windows (PowerShell, permanente)
+setx ${orgVar} "tu-token"
 
-# Windows (PowerShell, permanente)
-setx AZURE_DEVOPS_EXT_PAT "tu-token"`}</pre>
+# Linux / macOS
+export ${orgVar}="tu-token"`}</pre>
               <button
                 type="button"
                 onClick={() => openUrl(PAT_DOCS)}
