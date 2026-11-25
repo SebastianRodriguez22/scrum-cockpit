@@ -26,6 +26,16 @@ export interface AzureConfig {
 /** Ventana de fecha por defecto (días) si la config no la trae */
 export const DEFAULT_LOOKBACK_DAYS = 60;
 
+/**
+ * Una pestaña = un proyecto de Azure DevOps abierto (de cualquier organización).
+ * Se persiste sólo la config (sin PAT); los datos se guardan aparte por id.
+ */
+export interface ProjectTab {
+  /** Id interno estable de la pestaña (no es el id de ADO) */
+  id: string;
+  config: AzureConfig;
+}
+
 export interface WorkItem {
   id: number;
   type: string; // System.WorkItemType: "User Story" | "Bug" | "Task" | ...
