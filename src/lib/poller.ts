@@ -1,5 +1,11 @@
 // Motor de polling: carga inicial + ciclos incrementales contra Azure DevOps.
-import { useStore } from "../store/useStore";
+//
+// Multi-pestaña: sólo la pestaña activa consulta Azure. Cada ciclo queda atado
+// a la pestaña (y a la config) con la que arrancó: todo lo que escribe pasa por
+// `patchTab`, así que si el usuario cambia de pestaña a mitad de una consulta,
+// el resultado cae en la pestaña correcta (o se descarta si se cerró o se
+// reconfiguró) y nunca se mezcla con el proyecto que se está mirando.
+import { mergeFeed, toItemMap, useStore, type TabData } from "../store/useStore";
 import {
   getAllIterationDates,
   getIterations,
@@ -9,35 +15,71 @@ import {
   queryChangedIds,
 } from "./azureDevOps";
 import { updatesToEvents } from "./feedEvents";
-import type { AzureConfig } from "../types";
+import type { AzureConfig, FeedEvent, WorkItem } from "../types";
+
+/** Una ejecución del poller: qué pestaña, con qué config (con PAT) y contra qué config guardada */
+interface Run {
+  tabId: string;
+  /** Config efectiva (con el PAT resuelto) para llamar a la API */
+  cfg: AzureConfig;
+  /** Config guardada de la pestaña al arrancar; si cambia, se descartan los resultados */
+  base: AzureConfig;
+}
 
 let timer: ReturnType<typeof setInterval> | null = null;
-let ticking = false;
-// Si llega un pedido de sync mientras hay un tick en curso, lo encolamos para
-// que "Actualizar ahora" no se pierda silenciosamente.
-let rerunPending = false;
-// Token de arranque: invalida cargas iniciales en vuelo si el config cambia o
-// se detiene el poller mientras el fullSync todavía no terminó.
-let startToken = 0;
+/** Ejecución vigente (la de la pestaña activa) */
+let current: Run | null = null;
+// Ciclos en curso / pedidos pendientes, por pestaña. Si llega un pedido de
+// sync mientras hay un tick en curso, lo encolamos para que "Actualizar ahora"
+// no se pierda silenciosamente.
+const ticking = new Set<string>();
+const rerunPending = new Set<string>();
+// Cargas iniciales en curso, por pestaña (con la config con la que arrancaron)
+const loading = new Map<string, AzureConfig>();
 
 export function isPolling(): boolean {
   return timer !== null;
 }
 
+/** Escrituras de una ejecución, dirigidas siempre a su pestaña */
+function writerFor(run: Run) {
+  const patch = (fn: (d: TabData) => Partial<TabData>) =>
+    useStore.getState().patchTab(run.tabId, run.base, fn);
+  return {
+    /** true si la pestaña sigue existiendo con la misma config */
+    alive: () => patch(() => ({})),
+    data: () => useStore.getState().getTabData(run.tabId),
+    setItems: (items: WorkItem[]) => patch(() => ({ items: toItemMap(items) })),
+    mergeItems: (items: WorkItem[]) =>
+      patch((d) => ({ items: { ...d.items, ...toItemMap(items) } })),
+    addEvents: (events: FeedEvent[]) =>
+      events.length > 0 && patch((d) => ({ feed: mergeFeed(d.feed, events) })),
+    setIterations: (iterations: TabData["iterations"]) => patch(() => ({ iterations })),
+    setIterationDates: (iterationDates: TabData["iterationDates"]) =>
+      patch(() => ({ iterationDates })),
+    setStatus: (status: TabData["status"]) => patch(() => ({ status })),
+    setError: (error: string | null) =>
+      patch((d) => ({ error, status: error ? "error" : d.status })),
+    setLastSync: (lastSync: string) => patch(() => ({ lastSync })),
+    setWatermark: (watermark: string) => patch(() => ({ watermark })),
+  };
+}
+
 /** Carga inicial: trae todos los items + siembra el feed con la actividad reciente */
-async function fullSync(cfg: AzureConfig): Promise<void> {
-  const store = useStore.getState();
+async function fullSync(run: Run): Promise<void> {
+  const w = writerFor(run);
+  const { cfg } = run;
   const ids = await queryAllIds(cfg);
   const items = await getWorkItems(cfg, ids);
-  store.setItems(items);
+  if (!w.setItems(items)) return; // pestaña cerrada o reconfigurada
 
   getIterations(cfg)
-    .then(store.setIterations)
+    .then(w.setIterations)
     .catch(() => {});
 
   // Fechas de todas las iteraciones (incl. sprints viejos) para la ventana por meses.
   getAllIterationDates(cfg)
-    .then(store.setIterationDates)
+    .then(w.setIterationDates)
     .catch(() => {});
 
   // Sembrar feed con los 30 items modificados más recientemente
@@ -45,33 +87,35 @@ async function fullSync(cfg: AzureConfig): Promise<void> {
     .sort((a, b) => new Date(b.changedDate).getTime() - new Date(a.changedDate).getTime())
     .slice(0, 30);
   for (const it of recent) {
+    if (!w.alive()) return;
     try {
       const updates = await getWorkItemUpdates(cfg, it.id);
-      store.addEvents(updatesToEvents(it.id, it.type, it.title, updates));
+      w.addEvents(updatesToEvents(it.id, it.type, it.title, updates));
     } catch {
       /* item individual que falla no corta la carga */
     }
   }
-  await store.setWatermark(new Date().toISOString());
+  w.setWatermark(new Date().toISOString());
 }
 
 /** Ciclo incremental: detecta cambios desde el watermark y actualiza items + feed */
-async function tick(cfg: AzureConfig): Promise<void> {
-  if (ticking) {
-    rerunPending = true;
+async function tick(run: Run): Promise<void> {
+  const { tabId, cfg } = run;
+  if (ticking.has(tabId)) {
+    rerunPending.add(tabId);
     return;
   }
-  ticking = true;
-  const store = useStore.getState();
-  store.setStatus("syncing");
+  ticking.add(tabId);
+  const w = writerFor(run);
+  w.setStatus("syncing");
   try {
-    const since = store.watermark ?? undefined;
+    const since = w.data()?.watermark ?? undefined;
     const checkpoint = new Date().toISOString();
     const changedIds = await queryChangedIds(cfg, since);
 
     if (changedIds.length > 0) {
       const items = await getWorkItems(cfg, changedIds);
-      store.mergeItems(items);
+      if (!w.mergeItems(items)) return; // pestaña cerrada o reconfigurada
 
       // La WIQL filtra por día (no acepta hora), así que `changedIds` puede
       // incluir items ya vistos en ciclos anteriores del mismo día. Afinamos
@@ -84,68 +128,89 @@ async function tick(cfg: AzureConfig): Promise<void> {
 
       // Limitar a 50 detalles por ciclo para no saturar
       for (const it of fresh.slice(0, 50)) {
+        if (!w.alive()) return;
         try {
           const updates = await getWorkItemUpdates(cfg, it.id);
-          store.addEvents(updatesToEvents(it.id, it.type, it.title, updates));
+          w.addEvents(updatesToEvents(it.id, it.type, it.title, updates));
         } catch {
           /* noop */
         }
       }
     }
 
-    await store.setWatermark(checkpoint);
-    store.setLastSync(new Date().toISOString());
-    store.setStatus("ok");
-    store.setError(null);
+    w.setWatermark(checkpoint);
+    w.setLastSync(new Date().toISOString());
+    w.setStatus("ok");
+    w.setError(null);
   } catch (e) {
-    store.setError(e instanceof Error ? e.message : String(e));
+    w.setError(e instanceof Error ? e.message : String(e));
   } finally {
-    ticking = false;
-    // Atender un pedido que llegó mientras estábamos sincronizando
-    if (rerunPending) {
-      rerunPending = false;
-      void tick(cfg);
+    ticking.delete(tabId);
+    // Atender un pedido que llegó mientras estábamos sincronizando (con la
+    // config vigente de esa pestaña, si todavía es la activa)
+    if (rerunPending.delete(tabId) && current?.tabId === tabId) {
+      void tick(current);
     }
   }
 }
 
-/** Arranca el polling. Hace carga inicial si todavía no hay items. */
-export async function startPolling(cfg: AzureConfig): Promise<void> {
-  stopPolling(); // bumpea startToken => invalida cualquier arranque en vuelo
-  const myToken = startToken;
-  const store = useStore.getState();
+/** Monta el intervalo para la ejecución vigente y dispara un ciclo ya */
+function arm(run: Run): void {
+  if (timer !== null) clearInterval(timer);
+  const intervalMs = Math.max(10, run.cfg.pollIntervalSec) * 1000;
+  timer = setInterval(() => void tick(run), intervalMs);
+  void tick(run);
+}
 
-  if (Object.keys(store.items).length === 0) {
-    store.setStatus("syncing");
+/**
+ * Arranca el polling de una pestaña. Hace carga inicial si esa pestaña todavía
+ * no tiene items (si ya los tiene, en memoria, sigue incremental desde ahí).
+ */
+export async function startPolling(tabId: string, cfg: AzureConfig): Promise<void> {
+  stopPolling();
+  const base = useStore.getState().tabs.find((t) => t.id === tabId)?.config;
+  if (!base) return;
+  const run: Run = { tabId, cfg, base };
+  current = run;
+  const w = writerFor(run);
+
+  const hasItems = Object.keys(w.data()?.items ?? {}).length > 0;
+  if (!hasItems) {
+    // Si ya hay una carga inicial en curso para esta misma pestaña y config
+    // (p. ej. se fue y volvió rápido), no la duplicamos: al terminar, arma el
+    // intervalo si la pestaña sigue activa.
+    if (loading.get(tabId) === base) return;
+    loading.set(tabId, base);
+    w.setStatus("syncing");
     try {
-      await fullSync(cfg);
+      await fullSync(run);
     } catch (e) {
-      if (myToken === startToken) {
-        store.setError(e instanceof Error ? e.message : String(e));
-      }
+      w.setError(e instanceof Error ? e.message : String(e));
       return; // no arrancar el intervalo si la carga inicial falló
+    } finally {
+      if (loading.get(tabId) === base) loading.delete(tabId);
     }
-    // Si mientras cargábamos cambió el config o se detuvo el poller, este
-    // arranque quedó obsoleto: no pisamos estado ni montamos un segundo intervalo.
-    if (myToken !== startToken) return;
-    store.setLastSync(new Date().toISOString());
-    store.setStatus("ok");
+    w.setLastSync(new Date().toISOString());
+    w.setStatus("ok");
+    // Si mientras cargábamos se cambió de pestaña o de config, este arranque
+    // quedó obsoleto: no montamos el intervalo (lo hará el arranque vigente).
+    if (current?.tabId !== tabId || current.base !== base) return;
+    arm(current);
+    return;
   }
 
-  const intervalMs = Math.max(10, cfg.pollIntervalSec) * 1000;
-  timer = setInterval(() => void tick(cfg), intervalMs);
-  void tick(cfg);
+  arm(run);
 }
 
 export function stopPolling(): void {
-  startToken++; // invalida fullSync en curso de un startPolling previo
+  current = null;
   if (timer !== null) {
     clearInterval(timer);
     timer = null;
   }
 }
 
-/** Fuerza un ciclo manual ya mismo */
-export async function syncNow(cfg: AzureConfig): Promise<void> {
-  await tick(cfg);
+/** Fuerza un ciclo manual ya mismo (de la pestaña activa) */
+export async function syncNow(): Promise<void> {
+  if (current) await tick(current);
 }

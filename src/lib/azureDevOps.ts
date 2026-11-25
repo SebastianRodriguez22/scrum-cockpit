@@ -39,8 +39,9 @@ export interface CustomFieldRefs {
   sizeEstimate?: string; // "Estimación"
 }
 
-let customFieldCache: CustomFieldRefs | null = null;
-let customFieldKey = "";
+// Cache por org/proyecto (varias pestañas => varios proyectos a la vez). Se
+// guarda la promesa para que dos pedidos simultáneos compartan la misma consulta.
+const customFieldCache = new Map<string, Promise<CustomFieldRefs>>();
 
 /** Quita acentos y pasa a minúscula, para matchear nombres de campo */
 function norm(s: string): string {
@@ -54,23 +55,26 @@ function norm(s: string): string {
  * Descubre los reference names de los campos custom "Compromiso" y "Estimación"
  * consultando la lista de campos del proyecto. Se cachea por org/project.
  */
-export async function resolveCustomFields(cfg: AzureConfig): Promise<CustomFieldRefs> {
-  const key = `${cfg.org}/${cfg.project}`;
-  if (customFieldCache && customFieldKey === key) return customFieldCache;
-  try {
-    const url = `${projectUrl(cfg)}/_apis/wit/fields?api-version=${API_VERSION}`;
-    const data = await adoFetch<{ value: { name: string; referenceName: string }[] }>(cfg, url);
-    const find = (needle: string) =>
-      data.value.find((f) => norm(f.name).includes(needle))?.referenceName;
-    customFieldCache = {
-      commitment: find("comprom"),
-      sizeEstimate: find("estimac"),
-    };
-  } catch {
-    customFieldCache = {};
-  }
-  customFieldKey = key;
-  return customFieldCache;
+export function resolveCustomFields(cfg: AzureConfig): Promise<CustomFieldRefs> {
+  const key = `${cfg.org.toLowerCase()}/${cfg.project.toLowerCase()}`;
+  const cached = customFieldCache.get(key);
+  if (cached) return cached;
+  const pending = (async (): Promise<CustomFieldRefs> => {
+    try {
+      const url = `${projectUrl(cfg)}/_apis/wit/fields?api-version=${API_VERSION}`;
+      const data = await adoFetch<{ value: { name: string; referenceName: string }[] }>(cfg, url);
+      const find = (needle: string) =>
+        data.value.find((f) => norm(f.name).includes(needle))?.referenceName;
+      return {
+        commitment: find("comprom"),
+        sizeEstimate: find("estimac"),
+      };
+    } catch {
+      return {};
+    }
+  })();
+  customFieldCache.set(key, pending);
+  return pending;
 }
 
 /** Tipos de work item que seguimos */

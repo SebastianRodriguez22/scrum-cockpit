@@ -10,6 +10,7 @@ import { load, type Store } from "@tauri-apps/plugin-store";
 import type { AzureConfig, FeedEvent, ProjectTab, WorkItem } from "../types";
 import type { Iteration, IterationDates } from "../lib/azureDevOps";
 import { getEnvPat } from "../lib/env";
+import { useFilters } from "./useFilters";
 
 const STORE_FILE = "scrum-cockpit.json";
 const MAX_FEED = 500;
@@ -138,15 +139,37 @@ interface AppState extends TabData {
   /** Cierra una pestaña y borra sus datos guardados */
   closeTab: (tabId: string) => Promise<void>;
 
-  setItems: (items: WorkItem[]) => void;
-  mergeItems: (items: WorkItem[]) => void;
-  addEvents: (events: FeedEvent[]) => void;
-  setIterations: (its: Iteration[]) => void;
-  setIterationDates: (m: Record<string, IterationDates>) => void;
-  setStatus: (s: SyncStatus) => void;
-  setError: (e: string | null) => void;
-  setLastSync: (iso: string) => void;
-  setWatermark: (iso: string) => Promise<void>;
+  /** Datos actuales de una pestaña (activa o en cache); null si no está cargada */
+  getTabData: (tabId: string) => TabData | null;
+  /**
+   * Aplica cambios a los datos de UNA pestaña concreta, esté activa o no.
+   * Es la única vía de escritura del poller: así un resultado que llega tarde
+   * cae en su pestaña y nunca en la que el usuario está mirando ahora.
+   * Se descarta (devuelve false) si la pestaña se cerró o si su config cambió
+   * desde `baseConfig` (p. ej. se editó la ventana de fecha a mitad de carga).
+   */
+  patchTab: (
+    tabId: string,
+    baseConfig: AzureConfig,
+    fn: (current: TabData) => Partial<TabData>,
+  ) => boolean;
+}
+
+/** Mapa id -> item a partir de una lista */
+export function toItemMap(items: WorkItem[]): Record<number, WorkItem> {
+  const map: Record<number, WorkItem> = {};
+  for (const it of items) map[it.id] = it;
+  return map;
+}
+
+/** Suma eventos nuevos al feed (sin duplicados, más nuevos primero, con tope) */
+export function mergeFeed(feed: FeedEvent[], events: FeedEvent[]): FeedEvent[] {
+  const existing = new Set(feed.map((e) => e.id));
+  const fresh = events.filter((e) => !existing.has(e.id));
+  if (fresh.length === 0) return feed;
+  return [...fresh, ...feed]
+    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+    .slice(0, MAX_FEED);
 }
 
 export const useStore = create<AppState>((set, get) => {
@@ -172,6 +195,8 @@ export const useStore = create<AppState>((set, get) => {
     }
     const store = await getStore();
     await store.set(ACTIVE_KEY, target?.id ?? null);
+    // Filtros de la pestaña nueva, en el mismo momento que sus datos
+    useFilters.getState().switchTab(target?.id ?? null);
     set({
       ...data,
       tabs,
@@ -217,6 +242,7 @@ export const useStore = create<AppState>((set, get) => {
       const active = tabs.find((t) => t.id === activeTabId);
       const data = active ? await loadPersistedTabData(active.id) : emptyTabData();
       const envPat = await getEnvPat();
+      useFilters.getState().switchTab(activeTabId);
       set({
         ...data,
         tabs,
@@ -279,6 +305,7 @@ export const useStore = create<AppState>((set, get) => {
       await store.set(TABS_KEY, nextTabs);
       await store.delete(feedKey(tabId));
       await store.delete(watermarkKey(tabId));
+      useFilters.getState().forgetTab(tabId);
 
       if (tabId === activeTabId) {
         // Pasar a la vecina (la de la derecha, o la de la izquierda si era la última).
@@ -295,48 +322,36 @@ export const useStore = create<AppState>((set, get) => {
       await store.save();
     },
 
-    setItems: (items) => {
-      const map: Record<number, WorkItem> = {};
-      for (const it of items) map[it.id] = it;
-      set({ items: map });
+    getTabData: (tabId) => {
+      const s = get();
+      if (s.activeTabId === tabId) return snapshotOf(s);
+      return s.tabCache[tabId] ?? null;
     },
 
-    mergeItems: (items) => {
-      set((state) => {
-        const map = { ...state.items };
-        for (const it of items) map[it.id] = it;
-        return { items: map };
-      });
-    },
+    patchTab: (tabId, baseConfig, fn) => {
+      const s = get();
+      const tab = s.tabs.find((t) => t.id === tabId);
+      if (!tab || tab.config !== baseConfig) return false;
 
-    addEvents: (events) => {
-      if (events.length === 0) return;
-      set((state) => {
-        const existing = new Set(state.feed.map((e) => e.id));
-        const fresh = events.filter((e) => !existing.has(e.id));
-        if (fresh.length === 0) return state;
-        const merged = [...fresh, ...state.feed]
-          .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-          .slice(0, MAX_FEED);
-        // Persistir sin bloquear, en la clave de la pestaña activa
-        const tabId = state.activeTabId;
-        if (tabId) getStore().then((s) => s.set(feedKey(tabId), merged));
-        return { feed: merged };
-      });
-    },
-
-    setIterations: (its) => set({ iterations: its }),
-    setIterationDates: (m) => set({ iterationDates: m }),
-    setStatus: (s) => set({ status: s }),
-    setError: (e) => set({ error: e, status: e ? "error" : get().status }),
-    setLastSync: (iso) => set({ lastSync: iso }),
-    setWatermark: async (iso) => {
-      const tabId = get().activeTabId;
-      if (tabId) {
-        const store = await getStore();
-        await store.set(watermarkKey(tabId), iso);
+      let patch: Partial<TabData>;
+      if (s.activeTabId === tabId) {
+        patch = fn(snapshotOf(s));
+        set(patch);
+      } else {
+        const current = s.tabCache[tabId];
+        if (!current) return false;
+        patch = fn(current);
+        set({ tabCache: { ...s.tabCache, [tabId]: { ...current, ...patch } } });
       }
-      set({ watermark: iso });
+
+      // Persistir (sin bloquear) lo que va a disco, en las claves de ESA pestaña
+      if (patch.feed !== undefined || patch.watermark !== undefined) {
+        void getStore().then((store) => {
+          if (patch.feed !== undefined) void store.set(feedKey(tabId), patch.feed);
+          if (patch.watermark !== undefined) void store.set(watermarkKey(tabId), patch.watermark);
+        });
+      }
+      return true;
     },
   };
 });

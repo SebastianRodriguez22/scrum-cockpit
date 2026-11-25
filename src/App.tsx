@@ -22,6 +22,7 @@ export default function App() {
   const configLoaded = useStore((s) => s.configLoaded);
   const config = useStore((s) => s.config);
   const envPat = useStore((s) => s.envPat);
+  const activeTabId = useStore((s) => s.activeTabId);
   const loadPersisted = useStore((s) => s.loadPersisted);
 
   const [view, setView] = useState<View>("feed");
@@ -31,14 +32,15 @@ export default function App() {
     loadPersisted();
   }, [loadPersisted]);
 
-  // Arrancar / detener el poller según haya config (con PAT resuelto desde env si hace falta)
+  // Arrancar / detener el poller de la pestaña activa (con PAT resuelto desde env).
+  // Al cambiar de pestaña o de config se detiene el anterior y arranca el nuevo.
   useEffect(() => {
     const effective = resolveConfig(config, envPat);
-    if (effective && effective.pat && !editingConfig) {
-      startPolling(effective);
+    if (activeTabId && effective && effective.pat && !editingConfig) {
+      startPolling(activeTabId, effective);
       return () => stopPolling();
     }
-  }, [config, envPat, editingConfig]);
+  }, [activeTabId, config, envPat, editingConfig]);
 
   if (!configLoaded) {
     return (
@@ -55,7 +57,9 @@ export default function App() {
   return (
     <div className="h-full flex flex-col bg-slate-950">
       <TopBar view={view} onView={setView} onSettings={() => setEditingConfig(true)} />
-      <div className="flex-1 min-h-0">
+      {/* key por pestaña: al cambiar de proyecto las vistas se montan de nuevo,
+          así ningún panel abierto (comentarios, lead time) muestra datos del anterior */}
+      <div className="flex-1 min-h-0" key={activeTabId ?? "none"}>
         {view === "feed" && <Feed />}
         {view === "board" && <Board />}
         {view === "metrics" && <Metrics />}
@@ -156,8 +160,6 @@ function StatusBar() {
   const status = useStore((s) => s.status);
   const lastSync = useStore((s) => s.lastSync);
   const error = useStore((s) => s.error);
-  const config = useStore((s) => s.config);
-  const envPat = useStore((s) => s.envPat);
   const itemCount = useStore((s) => Object.keys(s.items).length);
 
   const dot =
@@ -188,10 +190,7 @@ function StatusBar() {
         </span>
       )}
       <button
-        onClick={() => {
-          const eff = resolveConfig(config, envPat);
-          if (eff && eff.pat) syncNow(eff);
-        }}
+        onClick={() => void syncNow()}
         className="ml-auto text-slate-400 hover:text-slate-200"
         disabled={status === "syncing"}
       >
