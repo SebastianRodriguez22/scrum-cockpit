@@ -7,19 +7,38 @@ import { DEFAULT_LOOKBACK_DAYS, type AzureConfig } from "../types";
 const PAT_DOCS = "https://learn.microsoft.com/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate";
 
 interface Props {
+  /** "edit": edita el proyecto de la pestaña activa. "add": abre uno nuevo en otra pestaña. */
+  mode: "edit" | "add";
   onDone: () => void;
+  /** Si viene, se muestra "Cancelar" (no se ofrece cuando no hay ningún proyecto abierto) */
+  onCancel?: () => void;
 }
 
-export default function Setup({ onDone }: Props) {
+export default function Setup({ mode, onDone, onCancel }: Props) {
   const config = useStore((s) => s.config);
   const envPat = useStore((s) => s.envPat);
+  const tabs = useStore((s) => s.tabs);
+  const activeTabId = useStore((s) => s.activeTabId);
   const saveConfig = useStore((s) => s.saveConfig);
+  const addTab = useStore((s) => s.addTab);
+  const switchTab = useStore((s) => s.switchTab);
 
-  const [org, setOrg] = useState(config?.org ?? "");
-  const [project, setProject] = useState(config?.project ?? "");
-  const [team, setTeam] = useState(config?.team ?? "");
-  const [interval, setInterval] = useState(config?.pollIntervalSec ?? 30);
-  const [lookbackDays, setLookbackDays] = useState(config?.lookbackDays ?? DEFAULT_LOOKBACK_DAYS);
+  // En modo "add" arrancamos en blanco, salvo la organización (lo más común es
+  // abrir otro proyecto de la misma org; se puede cambiar).
+  const initial = mode === "edit" ? config : null;
+  const [org, setOrg] = useState(initial?.org ?? config?.org ?? "");
+  const [project, setProject] = useState(initial?.project ?? "");
+  const [team, setTeam] = useState(initial?.team ?? "");
+  const [interval, setInterval] = useState(initial?.pollIntervalSec ?? 30);
+  const [lookbackDays, setLookbackDays] = useState(initial?.lookbackDays ?? DEFAULT_LOOKBACK_DAYS);
+
+  // ¿Ese org/proyecto ya está abierto en otra pestaña?
+  const duplicate = tabs.find(
+    (t) =>
+      !(mode === "edit" && t.id === activeTabId) &&
+      t.config.org.trim().toLowerCase() === org.trim().toLowerCase() &&
+      t.config.project.trim().toLowerCase() === project.trim().toLowerCase(),
+  );
 
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null);
@@ -36,7 +55,7 @@ export default function Setup({ onDone }: Props) {
   });
 
   // Solo se puede operar si el token está en la variable de entorno.
-  const canSubmit = Boolean(org.trim() && project.trim() && envPat);
+  const canSubmit = Boolean(org.trim() && project.trim() && envPat && !duplicate);
 
   async function handleTest() {
     setTesting(true);
@@ -53,7 +72,8 @@ export default function Setup({ onDone }: Props) {
   }
 
   async function handleSave() {
-    await saveConfig(buildConfig());
+    if (mode === "add") await addTab(buildConfig());
+    else await saveConfig(buildConfig());
     onDone();
   }
 
@@ -61,9 +81,13 @@ export default function Setup({ onDone }: Props) {
     <div className="h-full overflow-y-auto bg-slate-950 flex items-center justify-center p-6">
       <div className="w-full max-w-xl">
         <div className="mb-6 text-center">
-          <h1 className="text-2xl font-bold text-white">Scrum Cockpit</h1>
+          <h1 className="text-2xl font-bold text-white">
+            {mode === "add" && tabs.length > 0 ? "Abrir otro proyecto" : "Scrum Cockpit"}
+          </h1>
           <p className="text-slate-400 text-sm mt-1">
-            Conectá tu proyecto de Azure DevOps para ver el feed de actividad, el board y las métricas.
+            {mode === "add" && tabs.length > 0
+              ? "Se abre en una pestaña nueva. Puede ser de la misma organización o de otra."
+              : "Conectá tu proyecto de Azure DevOps para ver el feed de actividad, el board y las métricas."}
           </p>
         </div>
 
@@ -145,6 +169,22 @@ setx AZURE_DEVOPS_EXT_PAT "tu-token"`}</pre>
             />
           </Field>
 
+          {duplicate && (
+            <div className="text-sm rounded-lg px-3 py-2 bg-amber-500/10 text-amber-200 border border-amber-500/30">
+              Ese proyecto ya está abierto en otra pestaña.{" "}
+              <button
+                type="button"
+                className="underline text-amber-100 hover:text-white"
+                onClick={async () => {
+                  await switchTab(duplicate.id);
+                  onDone();
+                }}
+              >
+                Ir a esa pestaña
+              </button>
+            </div>
+          )}
+
           {result && (
             <div
               className={`text-sm rounded-lg px-3 py-2 ${
@@ -158,6 +198,11 @@ setx AZURE_DEVOPS_EXT_PAT "tu-token"`}</pre>
           )}
 
           <div className="flex gap-3 pt-2">
+            {onCancel && (
+              <button type="button" onClick={onCancel} className="btn-secondary">
+                Cancelar
+              </button>
+            )}
             <button
               type="button"
               onClick={handleTest}
@@ -172,7 +217,7 @@ setx AZURE_DEVOPS_EXT_PAT "tu-token"`}</pre>
               disabled={!canSubmit}
               className="btn-primary flex-1"
             >
-              Guardar y entrar
+              {mode === "add" && tabs.length > 0 ? "Abrir en pestaña nueva" : "Guardar y entrar"}
             </button>
           </div>
         </div>

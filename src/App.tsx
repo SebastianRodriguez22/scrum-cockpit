@@ -4,6 +4,7 @@ import { startPolling, stopPolling, syncNow } from "./lib/poller";
 import { relativeTime } from "./lib/format";
 import { DEFAULT_LOOKBACK_DAYS } from "./types";
 import Setup from "./views/Setup";
+import TabBar from "./components/TabBar";
 import Board from "./views/Board";
 import Feed from "./views/Feed";
 import Metrics from "./views/Metrics";
@@ -26,7 +27,9 @@ export default function App() {
   const loadPersisted = useStore((s) => s.loadPersisted);
 
   const [view, setView] = useState<View>("feed");
-  const [editingConfig, setEditingConfig] = useState(false);
+  // Setup abierto sobre la app: "edit" = configurar la pestaña activa,
+  // "add" = abrir otro proyecto en una pestaña nueva.
+  const [setupMode, setSetupMode] = useState<"edit" | "add" | null>(null);
 
   useEffect(() => {
     loadPersisted();
@@ -34,13 +37,15 @@ export default function App() {
 
   // Arrancar / detener el poller de la pestaña activa (con PAT resuelto desde env).
   // Al cambiar de pestaña o de config se detiene el anterior y arranca el nuevo.
+  // Mientras se edita la config de la pestaña activa, no se consulta.
+  const editing = setupMode === "edit";
   useEffect(() => {
     const effective = resolveConfig(config, envPat);
-    if (activeTabId && effective && effective.pat && !editingConfig) {
+    if (activeTabId && effective && effective.pat && !editing) {
       startPolling(activeTabId, effective);
       return () => stopPolling();
     }
-  }, [activeTabId, config, envPat, editingConfig]);
+  }, [activeTabId, config, envPat, editing]);
 
   if (!configLoaded) {
     return (
@@ -48,24 +53,44 @@ export default function App() {
     );
   }
 
-  // Sin token en la variable de entorno no se puede operar: mostramos el Setup,
-  // que explica cómo configurarla. El PAT nunca se pide ni se guarda en disco.
-  if (!config || editingConfig || !envPat) {
-    return <Setup onDone={() => setEditingConfig(false)} />;
+  // Sin proyectos abiertos, o sin token en la variable de entorno, no se puede
+  // operar: Setup a pantalla completa (explica cómo configurar el token). El
+  // PAT nunca se pide ni se guarda en disco.
+  if (!config || !envPat) {
+    return <Setup mode={config ? "edit" : "add"} onDone={() => setSetupMode(null)} />;
   }
 
   return (
     <div className="h-full flex flex-col bg-slate-950">
-      <TopBar view={view} onView={setView} onSettings={() => setEditingConfig(true)} />
-      {/* key por pestaña: al cambiar de proyecto las vistas se montan de nuevo,
-          así ningún panel abierto (comentarios, lead time) muestra datos del anterior */}
-      <div className="flex-1 min-h-0" key={activeTabId ?? "none"}>
-        {view === "feed" && <Feed />}
-        {view === "board" && <Board />}
-        {view === "metrics" && <Metrics />}
-        {view === "evolution" && <Evolution />}
-      </div>
-      <StatusBar />
+      <TabBar
+        adding={setupMode === "add"}
+        onAdd={() => setSetupMode("add")}
+        onSelect={() => setSetupMode(null)}
+      />
+      {setupMode ? (
+        <div className="flex-1 min-h-0">
+          <Setup
+            // key: al pasar de "editar" a "agregar" el formulario arranca de cero
+            key={`${setupMode}-${activeTabId}`}
+            mode={setupMode}
+            onDone={() => setSetupMode(null)}
+            onCancel={() => setSetupMode(null)}
+          />
+        </div>
+      ) : (
+        <>
+          <TopBar view={view} onView={setView} onSettings={() => setSetupMode("edit")} />
+          {/* key por pestaña: al cambiar de proyecto las vistas se montan de nuevo,
+              así ningún panel abierto (comentarios, lead time) muestra datos del anterior */}
+          <div className="flex-1 min-h-0" key={activeTabId ?? "none"}>
+            {view === "feed" && <Feed />}
+            {view === "board" && <Board />}
+            {view === "metrics" && <Metrics />}
+            {view === "evolution" && <Evolution />}
+          </div>
+          <StatusBar />
+        </>
+      )}
     </div>
   );
 }
