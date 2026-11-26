@@ -9,6 +9,7 @@ import Board from "./views/Board";
 import Feed from "./views/Feed";
 import Metrics from "./views/Metrics";
 import Evolution from "./views/Evolution";
+import ErrorBoundary from "./components/ErrorBoundary";
 
 type View = "feed" | "board" | "metrics" | "evolution";
 
@@ -87,10 +88,12 @@ export default function App() {
           {/* key por pestaña: al cambiar de proyecto las vistas se montan de nuevo,
               así ningún panel abierto (comentarios, lead time) muestra datos del anterior */}
           <div className="flex-1 min-h-0" key={activeTabId ?? "none"}>
-            {view === "feed" && <Feed />}
-            {view === "board" && <Board />}
-            {view === "metrics" && <Metrics />}
-            {view === "evolution" && <Evolution />}
+            <ErrorBoundary key={view} label={NAV.find((n) => n.id === view)?.label}>
+              {view === "feed" && <Feed />}
+              {view === "board" && <Board />}
+              {view === "metrics" && <Metrics />}
+              {view === "evolution" && <Evolution />}
+            </ErrorBoundary>
           </div>
           <StatusBar />
         </>

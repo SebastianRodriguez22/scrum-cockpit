@@ -63,11 +63,14 @@ export function resolveCustomFields(cfg: AzureConfig): Promise<CustomFieldRefs> 
     try {
       const url = `${projectUrl(cfg)}/_apis/wit/fields?api-version=${API_VERSION}`;
       const data = await adoFetch<{ value: { name: string; referenceName: string }[] }>(cfg, url);
-      const find = (needle: string) =>
-        data.value.find((f) => norm(f.name).includes(needle))?.referenceName;
+      // Primero el campo que se llama exactamente así; si no hay, el primero que
+      // lo contenga (evita tomar otro campo, p. ej. una fecha "de compromiso").
+      const find = (exact: string, needle: string) =>
+        (data.value.find((f) => norm(f.name) === exact) ??
+          data.value.find((f) => norm(f.name).includes(needle)))?.referenceName;
       return {
-        commitment: find("comprom"),
-        sizeEstimate: find("estimac"),
+        commitment: find("compromiso", "comprom"),
+        sizeEstimate: find("estimacion", "estimac"),
       };
     } catch {
       return {};
@@ -196,7 +199,11 @@ interface RawWorkItem {
 function mapWorkItem(raw: RawWorkItem, custom: CustomFieldRefs = {}): WorkItem {
   const f = raw.fields;
   const tagsRaw = (f["System.Tags"] as string) || "";
-  const str = (ref?: string) => (ref ? (f[ref] as string | undefined) : undefined);
+  // Sólo texto: si el campo trae otra cosa (número, booleano, objeto) se ignora
+  const str = (ref?: string) => {
+    const v = ref ? f[ref] : undefined;
+    return typeof v === "string" ? v : undefined;
+  };
   return {
     id: raw.id,
     type: (f["System.WorkItemType"] as string) || "",

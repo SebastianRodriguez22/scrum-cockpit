@@ -21,6 +21,8 @@ import {
 } from "../lib/leadTime";
 import type { WorkItemUpdate } from "../lib/azureDevOps";
 import { defaultCutoff, isUnplanned, sprintEntry, type SprintEntry } from "../lib/unplanned";
+import BurndownPanel from "./BurndownPanel";
+import ErrorBoundary from "../components/ErrorBoundary";
 
 const SIN_SPRINT = "(sin sprint)";
 
@@ -108,6 +110,10 @@ export default function Evolution() {
                 currentSprint={sprints.find((s) => s.path === currentPath) ?? sprints[0]}
                 isCurrent={sprints.some((s) => s.path === currentPath)}
               />
+
+              <ErrorBoundary label="el burndown">
+                <BurndownPanel sprints={sprints} currentPath={currentPath} />
+              </ErrorBoundary>
 
               <Panel title="Story points por sprint (hecho vs. restante)">
                 <SprintBarChart sprints={[...sprints].reverse()} metric="points" />
