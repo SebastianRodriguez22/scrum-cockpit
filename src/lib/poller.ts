@@ -15,6 +15,7 @@ import {
   queryChangedIds,
 } from "./azureDevOps";
 import { updatesToEvents } from "./feedEvents";
+import { rememberUpdates } from "./leadTime";
 import type { AzureConfig, FeedEvent, WorkItem } from "../types";
 
 /** Una ejecución del poller: qué pestaña, con qué config (con PAT) y contra qué config guardada */
@@ -90,6 +91,7 @@ async function fullSync(run: Run): Promise<void> {
     if (!w.alive()) return;
     try {
       const updates = await getWorkItemUpdates(cfg, it.id);
+      rememberUpdates(cfg, it, updates); // lo reusan Lead Time / Trabajo no planeado
       w.addEvents(updatesToEvents(it.id, it.type, it.title, updates));
     } catch {
       /* item individual que falla no corta la carga */
@@ -131,6 +133,7 @@ async function tick(run: Run): Promise<void> {
         if (!w.alive()) return;
         try {
           const updates = await getWorkItemUpdates(cfg, it.id);
+          rememberUpdates(cfg, it, updates); // lo reusan Lead Time / Trabajo no planeado
           w.addEvents(updatesToEvents(it.id, it.type, it.title, updates));
         } catch {
           /* noop */

@@ -30,6 +30,8 @@ const LEGACY_FEED_KEY = "feed";
 const LEGACY_WATERMARK_KEY = "watermark";
 const feedKey = (tabId: string) => `feed:${tabId}`;
 const watermarkKey = (tabId: string) => `watermark:${tabId}`;
+//   cutoffs:<tabId> -> { [iterationPath]: "YYYY-MM-DD" } fecha de corte de la planning
+const cutoffsKey = (tabId: string) => `cutoffs:${tabId}`;
 
 let tauriStore: Store | null = null;
 async function getStore(): Promise<Store> {
@@ -75,6 +77,12 @@ export interface TabData {
   lastSync: string | null;
   error: string | null;
   watermark: string | null;
+  /**
+   * Fecha de corte de la planning por sprint (iterationPath -> "YYYY-MM-DD"),
+   * sólo para los sprints donde el usuario la cambió. Lo que entra al sprint
+   * después de esa fecha cuenta como trabajo no planeado.
+   */
+  planningCutoffs: Record<string, string>;
 }
 
 function emptyTabData(): TabData {
@@ -87,6 +95,7 @@ function emptyTabData(): TabData {
     lastSync: null,
     error: null,
     watermark: null,
+    planningCutoffs: {},
   };
 }
 
@@ -101,6 +110,7 @@ function snapshotOf(s: TabData): TabData {
     lastSync: s.lastSync,
     error: s.error,
     watermark: s.watermark,
+    planningCutoffs: s.planningCutoffs,
   };
 }
 
@@ -111,6 +121,7 @@ async function loadPersistedTabData(tabId: string): Promise<TabData> {
     ...emptyTabData(),
     feed: (await store.get<FeedEvent[]>(feedKey(tabId))) ?? [],
     watermark: (await store.get<string>(watermarkKey(tabId))) ?? null,
+    planningCutoffs: (await store.get<Record<string, string>>(cutoffsKey(tabId))) ?? {},
   };
 }
 
@@ -142,6 +153,11 @@ interface AppState extends TabData {
   /** Cierra una pestaña y borra sus datos guardados */
   closeTab: (tabId: string) => Promise<void>;
 
+  /**
+   * Fecha de corte de la planning de un sprint de la pestaña activa
+   * ("YYYY-MM-DD"); null vuelve al default (inicio del sprint).
+   */
+  setPlanningCutoff: (sprintPath: string, day: string | null) => Promise<void>;
   /** Datos actuales de una pestaña (activa o en cache); null si no está cargada */
   getTabData: (tabId: string) => TabData | null;
   /**
@@ -324,6 +340,7 @@ export const useStore = create<AppState>((set, get) => {
       await store.set(TABS_KEY, nextTabs);
       await store.delete(feedKey(tabId));
       await store.delete(watermarkKey(tabId));
+      await store.delete(cutoffsKey(tabId));
       useFilters.getState().forgetTab(tabId);
 
       if (tabId === activeTabId) {
@@ -339,6 +356,17 @@ export const useStore = create<AppState>((set, get) => {
         set({ tabs: nextTabs, tabCache: cache });
       }
       await store.save();
+    },
+
+    setPlanningCutoff: async (sprintPath, day) => {
+      const tabId = get().activeTabId;
+      if (!tabId) return;
+      const next = { ...get().planningCutoffs };
+      if (day) next[sprintPath] = day;
+      else delete next[sprintPath];
+      set({ planningCutoffs: next });
+      const store = await getStore();
+      await store.set(cutoffsKey(tabId), next);
     },
 
     getTabData: (tabId) => {

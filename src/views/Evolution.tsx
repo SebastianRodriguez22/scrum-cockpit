@@ -15,9 +15,12 @@ import {
   CREATED_LABEL,
   CREATED_SENTINEL,
   fetchTimelines,
+  fetchUpdates,
   leadTimeDays,
   type StateChange,
 } from "../lib/leadTime";
+import type { WorkItemUpdate } from "../lib/azureDevOps";
+import { defaultCutoff, isUnplanned, sprintEntry, type SprintEntry } from "../lib/unplanned";
 
 const SIN_SPRINT = "(sin sprint)";
 
@@ -121,6 +124,8 @@ export default function Evolution() {
               <Panel title="Bugs cargados por persona (origen del problema)">
                 <CreatedBugsByPerson items={items} />
               </Panel>
+
+              <UnplannedPanel sprints={sprints} />
 
               <LeadTimePanel items={items} />
 
@@ -790,6 +795,292 @@ function LeadTimePanel({ items }: { items: WorkItem[] }) {
                   </>
                 )
               )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type UnplannedMetric = "items" | "points";
+
+interface ClassifiedItem {
+  item: WorkItem;
+  entry: SprintEntry;
+  unplanned: boolean;
+}
+
+interface UnplannedRow {
+  sprint: SprintBucket;
+  /** "YYYY-MM-DD" del inicio del sprint; null si Azure no tiene la fecha */
+  startDay: string | null;
+  /** Fecha de corte vigente (la editada o el inicio del sprint) */
+  cutoff: string | null;
+  custom: boolean;
+  classified: ClassifiedItem[];
+  unplannedValue: number;
+  totalValue: number;
+}
+
+/** Trabajo no planeado sólo mira User Stories (no bugs ni tasks) */
+const storiesOf = (s: SprintBucket) => s.items.filter((it) => it.type === "User Story");
+
+const fmtDay = (iso: string) =>
+  new Date(iso).toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit" });
+
+/**
+ * Trabajo no planeado: items que entraron al sprint después de la planning.
+ * Colapsado por defecto; al abrirlo trae el historial de cada item (on-demand,
+ * compartido con Lead Time). La fecha de corte es editable por sprint, porque
+ * a veces la planning se atrasa unos días.
+ */
+function UnplannedPanel({ sprints }: { sprints: SprintBucket[] }) {
+  const config = useStore((s) => s.config);
+  const envPat = useStore((s) => s.envPat);
+  const iterations = useStore((s) => s.iterations);
+  const iterationDates = useStore((s) => s.iterationDates);
+  const cutoffs = useStore((s) => s.planningCutoffs);
+  const setPlanningCutoff = useStore((s) => s.setPlanningCutoff);
+
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [updates, setUpdates] = useState<Map<number, WorkItemUpdate[]> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [metric, setMetric] = useState<UnplannedMetric>("items");
+  const [openSprint, setOpenSprint] = useState<string | null>(null);
+  const loadingRef = useRef(false);
+
+  // Inicio de cada sprint: árbol de iteraciones del proyecto (incluye sprints
+  // viejos) y, si falta, las iteraciones del equipo.
+  const startOf = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const it of iterations) if (it.attributes?.startDate) m.set(it.path.toLowerCase(), it.attributes.startDate);
+    for (const [path, d] of Object.entries(iterationDates))
+      if (d.startDate) m.set(path.toLowerCase(), d.startDate);
+    return (path: string) => m.get(path.toLowerCase()) ?? null;
+  }, [iterations, iterationDates]);
+
+  const datedSprints = useMemo(
+    () => sprints.filter((s) => s.path !== SIN_SPRINT && startOf(s.path) && storiesOf(s).length > 0),
+    [sprints, startOf],
+  );
+  const undatedCount = sprints.filter((s) => s.path !== SIN_SPRINT).length - datedSprints.length;
+
+  // Con el panel abierto, traer el historial de los items de esos sprints que
+  // todavía no tenemos (al abrir, o si cambian los filtros / llegan sprints).
+  // Lo ya traído queda en el caché de sesión compartido con Lead Time.
+  useEffect(() => {
+    if (!open || loadingRef.current) return;
+    const missing = datedSprints.flatMap(storiesOf).filter((it) => !updates?.has(it.id));
+    if (missing.length === 0) {
+      if (!updates) setUpdates(new Map());
+      return;
+    }
+    const eff = resolveConfig(config, envPat);
+    if (!eff || !eff.pat) {
+      setError("No hay conexión configurada.");
+      return;
+    }
+    loadingRef.current = true;
+    setLoading(true);
+    setError(null);
+    setProgress({ done: 0, total: missing.length });
+    fetchUpdates(eff, missing, (done, total) => setProgress({ done, total }))
+      .then((fetched) => setUpdates((prev) => new Map([...(prev ?? []), ...fetched])))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => {
+        loadingRef.current = false;
+        setLoading(false);
+      });
+  }, [open, config, envPat, datedSprints, updates]);
+
+  const rows = useMemo<UnplannedRow[]>(() => {
+    if (!updates) return [];
+    const valueOf = (it: WorkItem) => (metric === "points" ? it.storyPoints ?? 0 : 1);
+    return datedSprints.map((s) => {
+      const start = startOf(s.path)!;
+      const startDay = defaultCutoff(start);
+      const cutoff = cutoffs[s.path] ?? startDay;
+      const classified = storiesOf(s)
+        .filter((it) => updates.has(it.id))
+        .map((it) => {
+          const entry = sprintEntry(updates.get(it.id)!, s.path, it.createdDate, it.createdBy);
+          return { item: it, entry, unplanned: isUnplanned(entry, cutoff) };
+        });
+      const sum = (xs: ClassifiedItem[]) => xs.reduce((acc, c) => acc + valueOf(c.item), 0);
+      return {
+        sprint: s,
+        startDay,
+        cutoff,
+        custom: Boolean(cutoffs[s.path]),
+        classified,
+        unplannedValue: sum(classified.filter((c) => c.unplanned)),
+        totalValue: sum(classified),
+      };
+    });
+  }, [updates, datedSprints, startOf, cutoffs, metric]);
+
+  const summary = useMemo(() => {
+    const withData = rows.filter((r) => r.totalValue > 0);
+    const pcts = withData.map((r) => r.unplannedValue / r.totalValue);
+    const unplannedItems = rows.flatMap((r) => r.classified.filter((c) => c.unplanned));
+    return {
+      sprints: withData.length,
+      avgPct: pcts.length ? (pcts.reduce((a, b) => a + b, 0) / pcts.length) * 100 : 0,
+      unplannedCount: unplannedItems.length,
+      unplannedValue: rows.reduce((a, r) => a + r.unplannedValue, 0),
+      analyzed: rows.reduce((a, r) => a + r.classified.length, 0),
+    };
+  }, [rows]);
+
+  const unit = metric === "points" ? "pts" : "US";
+
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-xl">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full text-left p-4 flex items-center gap-3"
+      >
+        <span className="text-slate-600">{open ? "▾" : "▸"}</span>
+        <span className="text-sm font-semibold text-slate-300">🚨 Trabajo no planeado</span>
+        <span className="text-xs text-slate-500">US que entraron al sprint después de la planning</span>
+        {updates && summary.sprints > 0 && (
+          <span className="ml-auto text-sm text-amber-300 font-semibold">
+            prom. {Math.round(summary.avgPct)}%
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="border-t border-slate-800 p-4 space-y-3">
+          {loading && (
+            <p className="text-sm text-slate-400">
+              Cargando historial… {progress.done}/{progress.total}
+            </p>
+          )}
+          {error && <p className="text-sm text-red-400">{error}</p>}
+          {!loading && datedSprints.length === 0 && (
+            <p className="text-sm text-slate-500">
+              No hay sprints con fecha de inicio en Azure DevOps y User Stories dentro de la
+              ventana actual (y los filtros elegidos).
+            </p>
+          )}
+
+          {updates && rows.length > 0 && (
+            <>
+              <div className="flex flex-wrap items-center gap-2">
+                <Toggle active={metric === "items"} onClick={() => setMetric("items")}>
+                  Cantidad de US
+                </Toggle>
+                <Toggle active={metric === "points"} onClick={() => setMetric("points")}>
+                  Story points
+                </Toggle>
+                <span className="text-xs text-slate-500 ml-auto">
+                  Fecha de corte: lo que entra después de ese día cuenta como no planeado.
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <Stat label="Sprints analizados" value={String(summary.sprints)} tone="text-slate-200" />
+                <Stat label="No planeado (prom.)" value={`${Math.round(summary.avgPct)}%`} tone="text-amber-300" />
+                <Stat
+                  label={`No planeado (${unit})`}
+                  value={String(summary.unplannedValue)}
+                  tone="text-amber-300"
+                />
+                <Stat
+                  label="US no planeadas / analizadas"
+                  value={`${summary.unplannedCount}/${summary.analyzed}`}
+                  tone="text-slate-200"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                {rows.map((r) => {
+                  const pct = r.totalValue ? (r.unplannedValue / r.totalValue) * 100 : 0;
+                  const unplannedList = r.classified.filter((c) => c.unplanned);
+                  const isOpen = openSprint === r.sprint.path;
+                  return (
+                    <div key={r.sprint.path} className="bg-slate-800/40 rounded-lg">
+                      <div className="flex items-center gap-2 text-sm px-2 py-1.5">
+                        <button
+                          onClick={() => setOpenSprint(isOpen ? null : r.sprint.path)}
+                          className="flex items-center gap-2 w-36 shrink-0 text-left"
+                          disabled={unplannedList.length === 0}
+                          title={unplannedList.length ? "Ver items no planeados" : undefined}
+                        >
+                          <span className="text-slate-600 w-3">
+                            {unplannedList.length ? (isOpen ? "▾" : "▸") : ""}
+                          </span>
+                          <span className="text-slate-300 truncate" title={r.sprint.label}>
+                            {r.sprint.label}
+                          </span>
+                        </button>
+                        <label className="flex items-center gap-1 text-xs text-slate-500 shrink-0">
+                          corte
+                          <input
+                            type="date"
+                            value={r.cutoff ?? ""}
+                            onChange={(e) =>
+                              void setPlanningCutoff(
+                                r.sprint.path,
+                                // Volver a la fecha de inicio = sacar el override
+                                e.target.value && e.target.value !== r.startDay ? e.target.value : null,
+                              )
+                            }
+                            className={`bg-slate-900 border rounded px-1.5 py-0.5 text-xs [color-scheme:dark] outline-none focus:border-sky-500 ${
+                              r.custom ? "border-amber-500/60 text-amber-200" : "border-slate-700 text-slate-200"
+                            }`}
+                            title={`Inicio del sprint: ${r.startDay}`}
+                          />
+                          {r.custom && (
+                            <button
+                              onClick={() => void setPlanningCutoff(r.sprint.path, null)}
+                              className="text-slate-500 hover:text-slate-200"
+                              title="Volver al inicio del sprint"
+                            >
+                              ↺
+                            </button>
+                          )}
+                        </label>
+                        <div className="flex-1 bg-sky-500/50 rounded h-3.5 overflow-hidden flex justify-end min-w-16">
+                          <div className="bg-amber-500/90 h-full" style={{ width: `${pct}%` }} />
+                        </div>
+                        <span className="text-slate-400 w-32 text-right tabular-nums shrink-0">
+                          {r.unplannedValue}/{r.totalValue} {unit}
+                          <span className="text-amber-300 font-medium"> · {Math.round(pct)}%</span>
+                        </span>
+                      </div>
+                      {isOpen && (
+                        <div className="px-3 pb-2 space-y-1 max-h-60 overflow-y-auto">
+                          {[...unplannedList]
+                            .sort((a, b) => a.entry.date.localeCompare(b.entry.date))
+                            .map(({ item, entry }) => (
+                              <div key={item.id} className="flex items-center gap-2">
+                                <div className="flex-1 min-w-0">
+                                  <ItemRow item={item} />
+                                </div>
+                                <span className="text-xs text-slate-400 w-48 text-right shrink-0 truncate">
+                                  {entry.atCreation ? "creado" : "agregado"} {fmtDay(entry.date)}
+                                  {entry.by && <span className="text-slate-500"> · {entry.by}</span>}
+                                </span>
+                              </div>
+                            ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              <p className="text-[11px] text-slate-600">
+                <span className="inline-block w-2 h-2 rounded-sm bg-sky-500/50 mr-1" />planeado
+                <span className="inline-block w-2 h-2 rounded-sm bg-amber-500/90 mx-1 ml-3" />no planeado
+                {undatedCount > 0 && ` · ${undatedCount} sprint(s) sin fecha de inicio en Azure no se analizan.`}
+                {" "}No incluye items que se sacaron del sprint.
+              </p>
             </>
           )}
         </div>
