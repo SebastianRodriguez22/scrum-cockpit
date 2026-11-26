@@ -1,6 +1,9 @@
 // Cálculo de Lead/Cycle Time a partir del historial de estados de un work item.
-// El historial se trae on-demand (1 request por item, cacheado en sesión) porque
-// es pesado y sólo hace falta cuando se abre el panel de Lead Time del Evolutivo.
+// El historial se trae on-demand (1 request por item) porque es pesado y sólo
+// hace falta en los paneles de Lead Time y Trabajo no planeado del Evolutivo.
+// Se guarda en memoria y en disco (recortado), así al reabrir la app sólo se
+// pide lo que cambió.
+import { load, type Store } from "@tauri-apps/plugin-store";
 import { getWorkItemUpdates, type WorkItemUpdate } from "./azureDevOps";
 import type { AzureConfig, WorkItem } from "../types";
 
@@ -94,6 +97,8 @@ export function leadTimeDays(
 interface CachedUpdates {
   changedDate: string;
   updates: WorkItemUpdate[];
+  /** Cuándo se guardó (ms), para limpiar lo viejo del disco */
+  savedAt: number;
 }
 const updatesCache = new Map<string, CachedUpdates>();
 const cacheKey = (cfg: AzureConfig, id: number) =>
@@ -103,9 +108,90 @@ const cacheKey = (cfg: AzureConfig, id: number) =>
 const CONCURRENCY = 8;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// --- Copia en disco -----------------------------------------------------------
+// Archivo aparte de la config (puede crecer). Sólo se guardan los campos que
+// usan estos paneles, para que pese poco. Lo que no se usó en DISK_MAX_AGE_DAYS
+// se borra al arrancar.
+const DISK_FILE = "history-cache.json";
+const DISK_MAX_AGE_DAYS = 120;
+/** Campos del historial que se conservan (estado, sprint y fecha del cambio) */
+const KEPT_FIELDS = ["System.State", "System.IterationPath", "System.ChangedDate"];
+
+let disk: Store | null = null;
+let diskReady: Promise<void> | null = null;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Abre el archivo (una sola vez), limpia lo viejo y carga el resto en memoria */
+function ensureDisk(): Promise<void> {
+  if (!diskReady) {
+    diskReady = (async () => {
+      try {
+        const store = await load(DISK_FILE, { autoSave: false, defaults: {} });
+        const oldest = Date.now() - DISK_MAX_AGE_DAYS * 86400000;
+        const stale: string[] = [];
+        for (const [key, value] of await store.entries<CachedUpdates>()) {
+          if (!value || typeof value.savedAt !== "number" || value.savedAt < oldest) {
+            stale.push(key);
+          } else if (!updatesCache.has(key)) {
+            updatesCache.set(key, value); // lo de memoria (más nuevo) tiene prioridad
+          }
+        }
+        for (const key of stale) await store.delete(key);
+        if (stale.length) await store.save();
+        disk = store;
+      } catch {
+        disk = null; // sin disco, sigue funcionando sólo en memoria
+      }
+    })();
+  }
+  return diskReady;
+}
+
+/** Agrupa las escrituras: guarda el archivo 2 s después del último cambio */
+function scheduleSave(): void {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    void disk?.save().catch(() => {});
+  }, 2000);
+}
+
+/** Historial recortado a lo que usan Lead Time y Trabajo no planeado */
+export function trimUpdates(updates: WorkItemUpdate[]): WorkItemUpdate[] {
+  const out: WorkItemUpdate[] = [];
+  for (const u of updates) {
+    const fields: NonNullable<WorkItemUpdate["fields"]> = {};
+    for (const f of KEPT_FIELDS) if (u.fields?.[f]) fields[f] = u.fields[f];
+    // Revisiones que sólo tocan otros campos no aportan nada (salvo la creación)
+    const useful = u.rev === 1 || "System.State" in fields || "System.IterationPath" in fields;
+    if (!useful) continue;
+    out.push({
+      id: u.id,
+      rev: u.rev,
+      revisedBy: u.revisedBy?.displayName ? { displayName: u.revisedBy.displayName } : undefined,
+      revisedDate: u.revisedDate,
+      fields,
+    });
+  }
+  return out;
+}
+
+function putCache(key: string, entry: CachedUpdates): void {
+  updatesCache.set(key, entry);
+  void ensureDisk().then(async () => {
+    if (!disk) return;
+    await disk.set(key, entry);
+    scheduleSave();
+  });
+}
+
 /** Guarda en el caché un historial ya traído (lo usa el poller) */
 export function rememberUpdates(cfg: AzureConfig, item: WorkItem, updates: WorkItemUpdate[]): void {
-  updatesCache.set(cacheKey(cfg, item.id), { changedDate: item.changedDate, updates });
+  putCache(cacheKey(cfg, item.id), {
+    changedDate: item.changedDate,
+    updates: trimUpdates(updates),
+    savedAt: Date.now(),
+  });
 }
 
 /** Historial de un item con hasta 2 reintentos (p. ej. si Azure limita por exceso de pedidos) */
@@ -131,6 +217,7 @@ export async function fetchUpdates(
   items: WorkItem[],
   onProgress?: (done: number, total: number) => void,
 ): Promise<Map<number, WorkItemUpdate[]>> {
+  await ensureDisk();
   const result = new Map<number, WorkItemUpdate[]>();
   const pending: WorkItem[] = [];
   for (const it of items) {
@@ -148,7 +235,7 @@ export async function fetchUpdates(
       try {
         const updates = await getUpdatesWithRetry(cfg, it.id);
         rememberUpdates(cfg, it, updates);
-        result.set(it.id, updates);
+        result.set(it.id, trimUpdates(updates)); // igual que lo que sale del caché
       } catch {
         result.set(it.id, []);
       }
