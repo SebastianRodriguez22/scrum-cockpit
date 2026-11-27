@@ -49,15 +49,17 @@ const parseDay = (day: string) => {
 };
 
 /**
- * Días hábiles (lunes a viernes) entre `startDay` y `finishDay`, inclusive. El
- * primer día se incluye siempre, aunque caiga en fin de semana.
+ * Días hábiles (lunes a viernes) entre `startDay` y `finishDay`, inclusive, sin
+ * los días libres del equipo (feriados de Capacity). El primer día se incluye
+ * siempre, aunque caiga en fin de semana o feriado.
  */
-export function workingDays(startDay: string, finishDay: string): string[] {
+export function workingDays(startDay: string, finishDay: string, daysOff?: Set<string>): string[] {
   const out: string[] = [];
   const end = parseDay(finishDay).getTime();
   for (let d = parseDay(startDay); d.getTime() <= end && out.length < 400; d.setDate(d.getDate() + 1)) {
     const wd = d.getDay();
-    if (out.length === 0 || (wd !== 0 && wd !== 6)) out.push(toDay(d));
+    const day = toDay(d);
+    if (out.length === 0 || (wd !== 0 && wd !== 6 && !daysOff?.has(day))) out.push(day);
   }
   return out;
 }
@@ -88,10 +90,12 @@ export function buildBurndown(opts: {
   cutoffDay: string;
   valueOf: (it: WorkItem) => number;
   now?: number;
+  /** Feriados del equipo ("YYYY-MM-DD"), no cuentan como días hábiles */
+  daysOff?: Set<string>;
 }): Burndown {
   const { items, updates, sprintPath, startDay, finishDay, cutoffDay, valueOf } = opts;
   const now = opts.now ?? Date.now();
-  const days = workingDays(startDay, finishDay);
+  const days = workingDays(startDay, finishDay, opts.daysOff);
   const todayDay = toDay(new Date(now));
 
   const tracked = items.map((it) => {

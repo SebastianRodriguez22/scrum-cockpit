@@ -9,6 +9,9 @@ import { defaultCutoff } from "../lib/unplanned";
 import { buildBurndown, type BurndownDay } from "../lib/burndown";
 import { isDone } from "../lib/workItemStatus";
 import { ItemRow } from "./Metrics";
+import { useSprintDates } from "../lib/useSprintDates";
+import { useCapacity } from "../lib/useCapacity";
+import { teamDaysOffSet } from "../lib/capacity";
 
 export interface BurndownSprint {
   path: string;
@@ -32,8 +35,6 @@ export default function BurndownPanel({
 }) {
   const config = useStore((s) => s.config);
   const envPat = useStore((s) => s.envPat);
-  const iterations = useStore((s) => s.iterations);
-  const iterationDates = useStore((s) => s.iterationDates);
   const cutoffs = useStore((s) => s.planningCutoffs);
 
   const [open, setOpen] = useState(true);
@@ -45,17 +46,7 @@ export default function BurndownPanel({
   const loadingRef = useRef(false);
 
   // Fechas de inicio y fin de cada sprint (equipo + árbol de iteraciones)
-  const datesOf = useMemo(() => {
-    const m = new Map<string, { start?: string; finish?: string }>();
-    const put = (path: string, start?: string, finish?: string) => {
-      const k = path.toLowerCase();
-      const prev = m.get(k) ?? {};
-      m.set(k, { start: start ?? prev.start, finish: finish ?? prev.finish });
-    };
-    for (const it of iterations) put(it.path, it.attributes?.startDate, it.attributes?.finishDate);
-    for (const [path, d] of Object.entries(iterationDates)) put(path, d.startDate, d.finishDate);
-    return (path: string) => m.get(path.toLowerCase());
-  }, [iterations, iterationDates]);
+  const datesOf = useSprintDates();
 
   // Sprints con fechas y al menos un item Mandatorio
   const options = useMemo(
@@ -101,6 +92,14 @@ export default function BurndownPanel({
   );
   const [hover, setHover] = useState<number | null>(null);
 
+  // Feriados del equipo cargados en Capacity de Azure DevOps
+  const capPaths = useMemo(() => (sprint ? [sprint.path] : []), [sprint]);
+  const cap = useCapacity(capPaths, open);
+  const daysOff = useMemo(
+    () => teamDaysOffSet(sprint ? cap.byPath.get(sprint.path.toLowerCase()) : null),
+    [cap.byPath, sprint],
+  );
+
   const ready = mandatory.length > 0 && mandatory.every((it) => updates.has(it.id));
 
   const burndown = useMemo(() => {
@@ -115,8 +114,20 @@ export default function BurndownPanel({
       finishDay: defaultCutoff(d.finish!),
       cutoffDay: cutoffs[sprint.path] ?? startDay,
       valueOf,
+      daysOff,
     });
-  }, [sprint, ready, mandatory, updates, datesOf, cutoffs, valueOf]);
+  }, [sprint, ready, mandatory, updates, datesOf, cutoffs, valueOf, daysOff]);
+  // Feriados que caen de lunes a viernes dentro del sprint (un rango cargado
+  // en Capacity puede incluir fines de semana, que no se cuentan)
+  const holidays = burndown
+    ? [...daysOff].filter((d) => {
+        const first = burndown.days[0]?.day;
+        const lastDay = burndown.days[burndown.days.length - 1]?.day;
+        const [y, m, dd] = d.split("-").map(Number);
+        const wd = new Date(y, m - 1, dd).getDay();
+        return first != null && lastDay != null && d >= first && d <= lastDay && wd !== 0 && wd !== 6;
+      }).length
+    : 0;
 
   const unit = metric === "points" ? "pts" : "items";
   const lastPast = burndown ? [...burndown.days].reverse().find((d) => d.remaining != null) : undefined;
@@ -191,7 +202,11 @@ export default function BurndownPanel({
                   <p className="text-[11px] text-slate-500">
                     La línea ideal parte de lo que quedaba por hacer al cierre de la planning ({fmtNum(burndown.plannedRemaining)}
                     {" "}de {fmtNum(burndown.planned)} {unit} comprometidos, según la fecha de corte de Trabajo no planeado) y
-                    baja hasta 0 el último día hábil. Se usa el Compromiso y los
+                    baja hasta 0 el último día hábil
+                    {holidays > 0
+                      ? ` (sin contar ${holidays} feriado${holidays > 1 ? "s" : ""} del equipo cargado${holidays > 1 ? "s" : ""} en Capacity)`
+                      : " (los feriados se toman de Capacity en Azure DevOps)"}
+                    . Se usa el Compromiso y los
                     puntos actuales de cada item; no incluye items que se sacaron del sprint.
                   </p>
                   <ItemList items={mandatory} />

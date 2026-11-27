@@ -22,6 +22,7 @@ import {
 import type { WorkItemUpdate } from "../lib/azureDevOps";
 import { defaultCutoff, isUnplanned, sprintEntry, type SprintEntry } from "../lib/unplanned";
 import BurndownPanel from "./BurndownPanel";
+import VelocityPanel from "./VelocityPanel";
 import ErrorBoundary from "../components/ErrorBoundary";
 
 const SIN_SPRINT = "(sin sprint)";
@@ -113,6 +114,10 @@ export default function Evolution() {
 
               <ErrorBoundary label="el burndown">
                 <BurndownPanel sprints={sprints} currentPath={currentPath} />
+              </ErrorBoundary>
+
+              <ErrorBoundary label="la velocidad">
+                <VelocityPanel sprints={sprints} />
               </ErrorBoundary>
 
               <Panel title="Story points por sprint (hecho vs. restante)">

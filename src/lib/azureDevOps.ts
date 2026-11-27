@@ -370,3 +370,80 @@ export async function getAllIterationDates(
   }
   return out;
 }
+
+// --- Capacidad del sprint (pestaña Capacity de Boards → Sprints) --------------
+// Todo es lectura. Requiere el scope Work Items (Read) para la capacidad y
+// Project and Team (Read) para los miembros del equipo.
+
+/** Rango de días libres tal cual lo guarda Azure DevOps (ambos extremos incluidos) */
+export interface DayOffRange {
+  start: string;
+  end: string;
+}
+
+export interface MemberCapacity {
+  name: string;
+  /** Horas por día sumando actividades (0 si no se cargó) */
+  capacityPerDay: number;
+  daysOff: DayOffRange[];
+}
+
+export interface SprintCapacity {
+  /** Días libres de todo el equipo (feriados) */
+  teamDaysOff: DayOffRange[];
+  /** Personas cargadas en Capacity (vacío si nunca se guardó) */
+  members: MemberCapacity[];
+}
+
+interface RawMemberCapacity {
+  teamMember?: { displayName?: string };
+  activities?: { capacityPerDay?: number }[];
+  daysOff?: DayOffRange[];
+}
+
+function teamPrefix(cfg: AzureConfig): string {
+  const team = cfg.team?.trim();
+  return `${projectUrl(cfg)}${team ? `/${encodeURIComponent(team)}` : ""}`;
+}
+
+/** Capacity y días libres del equipo para una iteración (por id) */
+export async function getSprintCapacity(cfg: AzureConfig, iterationId: string): Promise<SprintCapacity> {
+  const base = `${teamPrefix(cfg)}/_apis/work/teamsettings/iterations/${encodeURIComponent(iterationId)}`;
+  const [cap, off] = await Promise.all([
+    // 7.1 devuelve { teamMembers: [...] }; versiones viejas { value: [...] }
+    adoFetch<{ teamMembers?: RawMemberCapacity[]; value?: RawMemberCapacity[] }>(
+      cfg,
+      `${base}/capacities?api-version=${API_VERSION}`,
+    ),
+    adoFetch<{ daysOff?: DayOffRange[] }>(cfg, `${base}/teamdaysoff?api-version=${API_VERSION}`),
+  ]);
+  const raw = cap.teamMembers ?? cap.value ?? [];
+  return {
+    teamDaysOff: off.daysOff ?? [],
+    members: raw
+      .filter((m) => m.teamMember?.displayName)
+      .map((m) => ({
+        name: m.teamMember!.displayName!,
+        capacityPerDay: (m.activities ?? []).reduce((s, a) => s + (a.capacityPerDay ?? 0), 0),
+        daysOff: m.daysOff ?? [],
+      })),
+  };
+}
+
+/** Nombres de los miembros del equipo configurado (o del equipo por defecto) */
+export async function getTeamMemberNames(cfg: AzureConfig): Promise<string[]> {
+  let team = cfg.team?.trim();
+  const projectApi = `${orgUrl(cfg)}/_apis/projects/${encodeURIComponent(cfg.project)}`;
+  if (!team) {
+    const p = await adoFetch<{ defaultTeam?: { name?: string } }>(cfg, `${projectApi}?api-version=${API_VERSION}`);
+    team = p.defaultTeam?.name;
+    if (!team) return [];
+  }
+  const data = await adoFetch<{ value?: { identity?: { displayName?: string; isContainer?: boolean } }[] }>(
+    cfg,
+    `${projectApi}/teams/${encodeURIComponent(team)}/members?api-version=${API_VERSION}&$top=500`,
+  );
+  return (data.value ?? [])
+    .filter((m) => m.identity?.displayName && !m.identity.isContainer)
+    .map((m) => m.identity!.displayName!);
+}
